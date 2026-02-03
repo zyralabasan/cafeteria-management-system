@@ -18,9 +18,10 @@ class ReservationController extends Controller
     {
         $status = $request->query('status');
 
-        $q = Reservation::with(['user','items.menu.items']); // items -> menu -> foods
-        if (in_array($status, ['pending','approved','declined'], true)) {
-            $q->where('status',$status);
+        // Load user relationship for customer info
+        $q = Reservation::with(['user']);
+        if (in_array($status, ['pending','approved','declined', 'cancelled'], true)) {
+            $q->where('status', $status);
         }
 
         $reservations = $q->latest()->paginate(10)->withQueryString();
@@ -33,10 +34,15 @@ class ReservationController extends Controller
 
     public function show(Reservation $reservation)
     {
-        $reservation->load(['user','items.menu.items']);
+        // Load all necessary relationships
+        $reservation->load([
+            'user',
+            'items.menu.items', // menu items
+            'items.menu.items.recipes.inventoryItem' // for inventory checks
+        ]);
+        
         return view('admin.reservations.show', ['r' => $reservation]);
     }
-
     /**
      * Check inventory availability for a reservation
      */
@@ -272,10 +278,27 @@ class ReservationController extends Controller
         // Fetch all menus grouped by meal_time and type, eager load 'items' relationship
         $menus = \App\Models\Menu::with('items')->get()->groupBy(['meal_time', 'type']);
         
+        // Get default prices
+        $menuPrices = [];
+        $defaultStandardPrice = 150;
+        $defaultSpecialPrice = 200;
+        
+        // Organize prices by meal time and type
+        foreach ($menus as $meal_time => $types) {
+            foreach ($types as $type => $menuList) {
+                if ($menuList->isNotEmpty()) {
+                    $menuPrices[$type][$meal_time] = $menuList->map(function($menu) {
+                        return (object)[
+                            'price' => $menu->price ?? ($menu->type === 'special' ? 200 : 150)
+                        ];
+                    });
+                }
+            }
+        }
+        
         // Pass the menus and reservation data to the view
-        return view('customer.reservation_form_menu', compact('menus', 'reservationData'));
+        return view('customer.reservation_form_menu', compact('menus', 'reservationData', 'menuPrices'));
     }
-
 
     public function store(Request $request)
     {
@@ -287,7 +310,7 @@ class ReservationController extends Controller
             'notes' => 'nullable|string|max:1000',
             'reservations' => 'required|array',
             'reservations.*.*.category' => 'required|string',
-            'reservations.*.*.menu' => 'required|string',
+            'reservations.*.*.menu' => 'required|integer',
             'reservations.*.*.qty' => 'required|integer|min:0',
         ]);
 
@@ -299,15 +322,40 @@ class ReservationController extends Controller
             }
         }
 
-        // Create the reservation with data from both forms
+        // Extract time information from day_times JSON
+        $dayTimes = isset($reservationData['day_times']) ? json_decode($reservationData['day_times'], true) : [];
+
+        // Format times to ensure proper format before storing
+        foreach ($dayTimes as $date => &$times) {
+            if (isset($times['start_time'])) {
+                // Convert "7" to "7:00" and "7:30" stays "7:30"
+                $times['start_time'] = $this->formatTimeForStorage($times['start_time']);
+            }
+            if (isset($times['end_time'])) {
+                $times['end_time'] = $this->formatTimeForStorage($times['end_time']);
+            }
+        }
+
+        // Format event_time for display (use first day's start time)
+        $eventTime = '';
+        if ($dayTimes && count($dayTimes) > 0) {
+            $firstDayKey = array_keys($dayTimes)[0];
+            $firstDay = $dayTimes[$firstDayKey];
+            if (isset($firstDay['start_time'])) {
+                $eventTime = $firstDay['start_time'];
+            }
+        }
+
+        // Create the reservation with proper time format
         $reservation = Reservation::create([
             'user_id' => Auth::id(),
             'event_name' => $reservationData['activity'] ?? 'Catering Reservation',
             'event_date' => $reservationData['start_date'] ?? now()->format('Y-m-d'),
             'end_date' => $reservationData['end_date'] ?? null,
-            'event_time' => $reservationData['day_times'] ?? '07:00-10:00',
+            'event_time' => $eventTime, // Store formatted time
+            'day_times' => $dayTimes, // Store the complete JSON for multi-day times
             'number_of_persons' => $totalPersons,
-            'special_requests' => $validated['notes'],
+            'special_requests' => $validated['notes'] ?? null,
             'status' => 'pending',
             // Add additional fields
             'contact_person' => $reservationData['name'] ?? null,
@@ -324,22 +372,27 @@ class ReservationController extends Controller
         foreach ($validated['reservations'] as $day => $meals) {
             foreach ($meals as $meal => $data) {
                 if ($data['qty'] > 0) {
-                    // Find menu by name and meal_time
-                    $menu = \App\Models\Menu::where('name', $data['menu'])
-                        ->where('meal_time', $meal)
-                        ->first();
+                    // Find menu by ID (not by name)
+                    $menu = \App\Models\Menu::find($data['menu']);
+                    
 
                     if (!$menu) {
                         continue;
                     }
 
+
+                    // Extract day number from key (e.g., "day_1" -> 1)
+                    $dayNumber = (int) str_replace('day_', '', $day);
+
                     \App\Models\ReservationItem::create([
                         'reservation_id' => $reservation->id,
                         'menu_id' => $menu->id,
                         'quantity' => $data['qty'],
-                        'day_number' => $day, // Store which day this meal is for
+                        'day_number' => $dayNumber, // Fixed: Use extracted day number
                         'meal_time' => $meal,
                     ]);
+
+
                 }
             }
         }
@@ -361,10 +414,51 @@ class ReservationController extends Controller
 
         // Clear reservation data from session
         session()->forget('reservation_data');
+        
+        // Store receipt reservation ID in session for billing info
+        session(['receipt_reservation_id' => $reservation->id]);
 
-        return redirect()->route('reservation_details')->with('success', 'Reservation placed successfully!');
+        // Return JSON response for AJAX
+        if ($request->expectsJson()) {
+            return response()->json([
+                'success' => true,
+                'message' => 'Reservation placed successfully!',
+                'redirect_url' => route('reservation_details')
+            ]);
+        }
+
+
+        return redirect()->route('reservation_details')
+            ->with('success', 'Reservation placed successfully!');
     }
-    
+
+    /**
+     * Format time for storage (convert "7" to "7:00", keep "7:30" as is)
+     */
+    protected function formatTimeForStorage($timeString)
+    {
+        if (empty($timeString)) {
+            return $timeString;
+        }
+        
+        // If it's just a number like "7" or "10", add ":00"
+        if (preg_match('/^\d{1,2}$/', $timeString)) {
+            return $timeString . ':00';
+        }
+        
+        // If it's already in "HH:MM" format, return as is
+        if (preg_match('/^\d{1,2}:\d{2}$/', $timeString)) {
+            return $timeString;
+        }
+        
+        // If it's in "HH:MM:SS" format, remove seconds
+        if (preg_match('/^\d{1,2}:\d{2}:\d{2}$/', $timeString)) {
+            return preg_replace('/:\d{2}$/', '', $timeString);
+        }
+        
+        return $timeString;
+    }
+
     public function cancel(Request $request, Reservation $reservation)
     {
         // Ensure only the owner can cancel their reservation
@@ -398,4 +492,40 @@ class ReservationController extends Controller
 
         return redirect()->back()->with('success', 'Reservation cancelled successfully.');
     }
+    public function uploadReceipt(Request $request, Reservation $reservation)
+{
+    // Ensure user owns this reservation
+    if ($reservation->user_id !== Auth::id()) {
+        return redirect()->back()->with('error', 'Unauthorized action.');
+    }
+    
+    // Ensure reservation is approved
+    if ($reservation->status !== 'approved') {
+        return redirect()->back()->with('error', 'Only approved reservations can upload receipts.');
+    }
+    
+    $request->validate([
+        'receipt' => 'required|file|mimes:jpg,jpeg,png,pdf|max:5120', // 5MB max
+    ]);
+    
+    // Store the receipt file
+    $path = $request->file('receipt')->store('receipts', 'public');
+    
+    // Update reservation with receipt info
+    $reservation->update([
+        'receipt_path' => $path,
+        'receipt_uploaded_at' => now(),
+        'payment_status' => 'paid', // Change to 'under_review' if you want admin approval
+    ]);
+    
+    // Create audit trail
+    AuditTrail::create([
+        'user_id'     => Auth::id(),
+        'action'      => 'Uploaded Receipt',
+        'module'      => 'reservations',
+        'description' => 'uploaded payment receipt for reservation #' . $reservation->id,
+    ]);
+    
+    return redirect()->back()->with('success', 'Receipt uploaded successfully!');
+}
 }
